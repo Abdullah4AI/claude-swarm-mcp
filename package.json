@@ -1,0 +1,23 @@
+{
+  "name": "claude-swarm-mcp",
+  "version": "1.0.0",
+  "description": "Your Claude Code instances, working as a swarm — peer discovery, messaging, task delegation, and shared snippets via MCP",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "broker": "bun broker.ts",
+    "server": "bun server.ts",
+    "cli": "bun cli.ts",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1"
+  }
+}
