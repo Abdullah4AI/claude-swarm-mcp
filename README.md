@@ -51,6 +51,7 @@ Built on [Model Context Protocol](https://modelcontextprotocol.io/) with `claude
 ### 1. Install dependencies
 
 ```bash
+git clone https://github.com/Abdullah4AI/claude-swarm-mcp.git
 cd claude-swarm-mcp
 bun install
 ```
