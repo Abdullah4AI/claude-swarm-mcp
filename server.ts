@@ -502,11 +502,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
 
-  if (!myId && name !== "check_messages") {
-    // Allow check_messages to work regardless, but others need registration
-    if (!["list_peers"].includes(name)) {
-      return textResult("Not registered with broker yet", true);
-    }
+  if (!myId && !["check_messages", "list_peers"].includes(name)) {
+    return textResult("Not registered with broker yet", true);
   }
 
   try {

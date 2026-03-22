@@ -308,15 +308,22 @@ switch (cmd) {
 
   case "alerts": {
     try {
-      const peerId = process.argv[3] ?? "all";
-      // For CLI, just show recent alerts from the messages approach
-      const alerts = await brokerFetch<Array<{ id: number; from_id: string; to_id: string; message: string; priority: string; created_at: string; acknowledged: number }>>("/list-shared-files", { limit: 0 });
-      // Actually we need a list-alerts endpoint; let's use analytics instead
-      const analytics = await brokerFetch<{ peer_stats: Array<{ id: string; alerts_sent: number }> }>("/analytics");
-      console.log(colorize("Swarm alert summary:", c.bold));
-      for (const p of analytics.peer_stats) {
-        if (p.alerts_sent > 0) {
-          console.log(`  ${colorize(p.id, c.yellow)}: ${p.alerts_sent} alert(s) sent`);
+      const peerId = process.argv[3];
+      const alerts = await brokerFetch<Array<{ id: number; from_id: string; to_id: string; message: string; priority: string; created_at: string; acknowledged: number }>>("/list-alerts", {
+        peer_id: peerId, limit: 20,
+      });
+      if (alerts.length === 0) {
+        console.log(colorize("No alerts found.", c.yellow));
+      } else {
+        const priorityColors: Record<string, string> = { info: c.blue, warning: c.yellow, critical: c.red };
+        console.log(colorize(`Alerts (${alerts.length}):`, c.bold));
+        for (const a of alerts) {
+          const pColor = priorityColors[a.priority] ?? c.white;
+          const icon = { info: "ℹ️", warning: "⚠️", critical: "🚨" }[a.priority] ?? "ℹ️";
+          const ack = a.acknowledged ? colorize("ack", c.green) : colorize("unack", c.yellow);
+          console.log(`  ${icon} ${colorize(`#${a.id}`, c.bold)} [${colorize(a.priority.toUpperCase(), pColor)}] [${ack}] ${colorize(a.from_id, c.cyan)} -> ${colorize(a.to_id, c.magenta)}`);
+          console.log(`    ${a.message}`);
+          console.log(`    ${colorize(a.created_at, c.gray)}`);
         }
       }
     } catch {

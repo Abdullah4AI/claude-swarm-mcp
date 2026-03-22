@@ -604,16 +604,24 @@ function handleSetStatus(body: SetStatusRequest): void {
   updateStatus.run(body.status, body.id);
 }
 
-function handleShareFile(body: ShareFileRequest): { ok: boolean; file_id?: number; error?: string } {
+async function handleShareFile(body: ShareFileRequest): Promise<{ ok: boolean; file_id?: number; error?: string }> {
   const MAX_SIZE = 1024 * 1024; // 1MB
+
+  // Validate path: reject path traversal and absolute paths outside home
+  const { resolve } = await import("path");
+  const resolvedPath = resolve(body.file_path);
+  if (resolvedPath.includes("..") || resolvedPath.startsWith("/etc") || resolvedPath.startsWith("/var") || resolvedPath.startsWith("/usr")) {
+    return { ok: false, error: "Path not allowed: must be within user directories" };
+  }
+
   try {
-    const file = Bun.file(body.file_path);
+    const file = Bun.file(resolvedPath);
     const size = file.size;
     if (size > MAX_SIZE) {
       return { ok: false, error: `File too large: ${size} bytes (max ${MAX_SIZE})` };
     }
-    const content = new TextDecoder().decode(Bun.spawnSync(["cat", body.file_path]).stdout);
-    const filename = body.file_path.split("/").pop() ?? "unknown";
+    const content = await Bun.file(resolvedPath).text();
+    const filename = resolvedPath.split("/").pop() ?? "unknown";
     const mime = file.type || "text/plain";
     const now = new Date().toISOString();
     const result = insertSharedFile.run(body.author_id, filename, content, size, mime, now);
@@ -677,6 +685,14 @@ function handleAlertAll(body: AlertAllRequest): { ok: boolean; count: number } {
   }
 
   return { ok: true, count: peers.length };
+}
+
+function handleListAlerts(body: { peer_id?: string; limit?: number }): Alert[] {
+  const limit = body.limit ?? 20;
+  if (body.peer_id) {
+    return db.query("SELECT * FROM alerts WHERE to_id = ? OR from_id = ? ORDER BY created_at DESC LIMIT ?").all(body.peer_id, body.peer_id, limit) as Alert[];
+  }
+  return db.query("SELECT * FROM alerts ORDER BY created_at DESC LIMIT ?").all(limit) as Alert[];
 }
 
 function handlePinMessage(body: PinMessageRequest): { ok: boolean; pin_id: number } {
@@ -1128,7 +1144,7 @@ Bun.serve<{ peerId: string }>({
             handleSetStatus(body as SetStatusRequest);
             return Response.json({ ok: true });
           case "/share-file":
-            return Response.json(handleShareFile(body as ShareFileRequest));
+            return Response.json(await handleShareFile(body as ShareFileRequest));
           case "/list-shared-files":
             return Response.json(handleListSharedFiles(body as ListSharedFilesRequest));
           case "/get-shared-file":
@@ -1149,6 +1165,8 @@ Bun.serve<{ peerId: string }>({
             return Response.json(await handleRequestReview(body as RequestReviewRequest));
           case "/sync-status":
             return Response.json(await handleSyncStatus(body as SyncStatusRequest));
+          case "/list-alerts":
+            return Response.json(handleListAlerts(body as { peer_id?: string; limit?: number }));
           case "/unregister":
             handleUnregister(body as { id: string });
             return Response.json({ ok: true });
