@@ -28,12 +28,19 @@ Built on [Model Context Protocol](https://modelcontextprotocol.io/) with `claude
 | Task delegation | No | Yes |
 | Shared snippets | No | Yes |
 | Peer tags/groups | No | Yes |
+| Peer status/presence | No | Yes |
+| File sharing | No | Yes |
+| Urgent alerts | No | Yes |
+| Pinned messages | No | Yes |
+| Peer analytics | No | Yes |
+| Code review requests | No | Yes |
+| Git status sync | No | Yes |
 | WebSocket push | No | Yes |
 | HTTP polling fallback | Yes | Yes |
 | Auto-reconnect | No | Yes |
 | Rate limiting | No | Yes |
 | Message TTL (auto-cleanup) | No | Yes (24h) |
-| Web dashboard | No | Yes |
+| Web dashboard | No | Yes (enhanced) |
 | Auto-summary (Gemini) | OpenAI | Gemini Flash |
 | Colored CLI output | No | Yes |
 
@@ -200,6 +207,100 @@ Tags updated: [backend, api, database]
 Found 1 peer(s)...
 ```
 
+### Peer Status/Presence
+
+Set your availability so other peers know when you're focused:
+
+```
+> set_status(status: "busy")
+Status updated to: busy
+
+> list_peers(scope: "machine")
+Found 2 peer(s):
+  🟢 ID: abc12345  Status: active  ...
+  🟡 ID: xyz98765  Status: busy    ...
+```
+
+Status options: `active` (default), `busy`, `away`, `dnd` (do not disturb). DND peers still receive messages but senders get a warning.
+
+### File Sharing
+
+Share files directly with peers (max 1MB):
+
+```
+> share_file(file_path: "/path/to/config.json")
+File shared as #1: /path/to/config.json
+
+> list_shared_files()
+Shared files (1):
+  #1 "config.json" (application/json, 1234 bytes) by abc12345
+
+> get_shared_file(id: 1)
+File #1: "config.json"
+Content: { ... }
+```
+
+### Alerts
+
+Send urgent notifications with priority levels:
+
+```
+> alert_peer(to_id: "xyz98765", message: "Build is broken!", priority: "critical")
+Alert #1 sent to xyz98765 [CRITICAL]
+
+> alert_all(message: "Deploying to prod in 5 min", priority: "warning")
+Alert broadcast to 3 peer(s) [WARNING]
+```
+
+Priority levels: `info`, `warning`, `critical`.
+
+### Pinned Messages
+
+Pin important info visible to all peers:
+
+```
+> pin_message(content: "API endpoint changed to /v3")
+Message pinned as #1
+
+> list_pins()
+📌 #1 by abc12345: API endpoint changed to /v3
+
+> unpin_message(pin_id: 1)
+Pin #1 removed
+```
+
+### Auto-coordination
+
+Request code reviews and sync git status:
+
+```
+> request_review(to_id: "xyz98765")
+Review request sent to xyz98765
+# Sends git diff summary to the peer
+
+> sync_status()
+Git status broadcast to 3 peer(s)
+# Broadcasts branch, last commit, uncommitted changes
+```
+
+### Peer Analytics
+
+Get stats for yourself or any peer:
+
+```
+> peer_stats()
+Peer: abc12345
+Messages sent: 42
+Messages received: 38
+Tasks assigned: 5
+Tasks completed: 3
+Snippets shared: 7
+Alerts sent: 2
+Files shared: 1
+```
+
+The `/analytics` endpoint returns full swarm analytics as JSON.
+
 ### Message History
 
 Review past conversations:
@@ -222,10 +323,14 @@ Message history (3):
 
 Visual overview of your swarm at `http://127.0.0.1:7899/dashboard`:
 
-- Active peer count with summaries and tags
-- Total messages, pending tasks, shared snippets
-- Auto-refreshes every 10 seconds
+- Real-time peer list with colored status indicators (🟢 active, 🟡 busy, ⚪ away, 🔴 dnd)
+- Message activity graph (last 12 hours)
+- Active tasks list
+- Recent snippets
+- Pinned messages
+- Stats for messages, tasks, snippets, alerts, pins, and shared files
 - Dark theme
+- Auto-refreshes every 5 seconds
 
 ---
 
@@ -254,6 +359,18 @@ bun cli.ts tasks
 
 # View shared snippets
 bun cli.ts snippets
+
+# View pinned messages
+bun cli.ts pins
+
+# List shared files
+bun cli.ts files
+
+# Show alert summary
+bun cli.ts alerts
+
+# Show swarm analytics
+bun cli.ts analytics
 
 # Open dashboard in browser
 bun cli.ts dashboard

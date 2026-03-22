@@ -29,6 +29,10 @@ import type {
   Peer,
   Task,
   Snippet,
+  SharedFile,
+  Alert,
+  Pin,
+  PeerAnalytics,
   RegisterResponse,
   PollMessagesResponse,
   WsEvent,
@@ -158,6 +162,7 @@ Available tools:
 - message_history: View past sent/received messages
 - set_summary: Set a summary of what you're working on
 - set_tags: Tag yourself with labels (e.g. "frontend", "backend", "devops")
+- set_status: Set your status (active/busy/away/dnd)
 - check_messages: Manually check for new messages
 - delegate_task: Assign a task to another peer
 - list_tasks: See pending/completed tasks
@@ -165,8 +170,19 @@ Available tools:
 - share_snippet: Share a code snippet with all peers
 - list_snippets: See all shared snippets
 - get_snippet: Get a specific snippet by ID
+- share_file: Share a file with peers (max 1MB)
+- list_shared_files: List shared files
+- get_shared_file: Get a shared file by ID
+- alert_peer: Send an urgent alert to a specific peer (info/warning/critical)
+- alert_all: Send an urgent alert to all peers
+- pin_message: Pin an important message for all peers
+- list_pins: See all pinned messages
+- unpin_message: Remove a pin
+- peer_stats: Get analytics for yourself or another peer
+- request_review: Ask a peer to review your git changes
+- sync_status: Broadcast your git status to all peers
 
-When you start, proactively call set_summary and set_tags to help other instances understand your context.`,
+When you start, proactively call set_summary, set_tags, and set_status to help other instances understand your context.`,
   }
 );
 
@@ -334,6 +350,149 @@ const TOOLS = [
       required: ["id"],
     },
   },
+  // --- New tools ---
+  {
+    name: "set_status",
+    description: 'Set your status: "active", "busy", "away", or "dnd" (do not disturb). Visible to all peers.',
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        status: {
+          type: "string" as const,
+          enum: ["active", "busy", "away", "dnd"],
+          description: "Your status",
+        },
+      },
+      required: ["status"],
+    },
+  },
+  {
+    name: "share_file",
+    description: "Share a file with all peers. Reads the file content and stores it (max 1MB).",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        file_path: { type: "string" as const, description: "Absolute path to the file to share" },
+      },
+      required: ["file_path"],
+    },
+  },
+  {
+    name: "list_shared_files",
+    description: "List all shared files (without content). Use get_shared_file to retrieve content.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        limit: { type: "number" as const, description: "Max files to return (default: 20)" },
+      },
+    },
+  },
+  {
+    name: "get_shared_file",
+    description: "Get a shared file by ID, including its content.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        id: { type: "number" as const, description: "File ID" },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "alert_peer",
+    description: "Send an urgent alert to a specific peer. Different from regular messages - shows with priority flag.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        to_id: { type: "string" as const, description: "Target peer ID" },
+        message: { type: "string" as const, description: "Alert message" },
+        priority: {
+          type: "string" as const,
+          enum: ["info", "warning", "critical"],
+          description: "Alert priority level",
+        },
+      },
+      required: ["to_id", "message", "priority"],
+    },
+  },
+  {
+    name: "alert_all",
+    description: "Send an urgent alert to ALL peers. Use for critical announcements.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        message: { type: "string" as const, description: "Alert message" },
+        priority: {
+          type: "string" as const,
+          enum: ["info", "warning", "critical"],
+          description: "Alert priority level",
+        },
+      },
+      required: ["message", "priority"],
+    },
+  },
+  {
+    name: "pin_message",
+    description: "Pin an important message visible to all peers. Persists until unpinned.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        content: { type: "string" as const, description: "Message to pin" },
+      },
+      required: ["content"],
+    },
+  },
+  {
+    name: "list_pins",
+    description: "See all pinned messages.",
+    inputSchema: { type: "object" as const, properties: {} },
+  },
+  {
+    name: "unpin_message",
+    description: "Remove a pinned message by ID.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        pin_id: { type: "number" as const, description: "Pin ID to remove" },
+      },
+      required: ["pin_id"],
+    },
+  },
+  {
+    name: "peer_stats",
+    description: "Get analytics for yourself or another peer: messages sent/received, tasks, snippets, etc.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        target_id: { type: "string" as const, description: "Peer ID to get stats for (default: yourself)" },
+      },
+    },
+  },
+  {
+    name: "request_review",
+    description: "Ask a peer to review your recent git changes. Sends git diff summary to the peer.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        to_id: { type: "string" as const, description: "Target peer ID" },
+      },
+      required: ["to_id"],
+    },
+  },
+  {
+    name: "sync_status",
+    description: "Broadcast your git status (branch, uncommitted changes, last commit) to all peers.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        scope: {
+          type: "string" as const,
+          enum: ["machine", "directory", "repo"],
+          description: 'Scope of broadcast. Default: "machine".',
+        },
+      },
+    },
+  },
 ];
 
 // --- Tool handlers ---
@@ -364,7 +523,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         const lines = peers.map((p) => {
           const tags = (() => { try { return JSON.parse(p.tags) as string[]; } catch { return []; } })();
-          const parts = [`ID: ${p.id}`, `PID: ${p.pid}`, `CWD: ${p.cwd}`];
+          const statusIcon = { active: "🟢", busy: "🟡", away: "⚪", dnd: "🔴" }[p.status ?? "active"] ?? "🟢";
+          const parts = [`${statusIcon} ID: ${p.id}`, `PID: ${p.pid}`, `Status: ${p.status ?? "active"}`, `CWD: ${p.cwd}`];
           if (p.git_root) parts.push(`Repo: ${p.git_root}`);
           if (p.tty) parts.push(`TTY: ${p.tty}`);
           if (p.summary) parts.push(`Summary: ${p.summary}`);
@@ -378,11 +538,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       case "send_message": {
         const { to_id, message } = args as { to_id: string; message: string };
-        const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
+        const result = await brokerFetch<{ ok: boolean; error?: string; warning?: string }>("/send-message", {
           from_id: myId, to_id, text: message,
         });
         if (!result.ok) return textResult(`Failed to send: ${result.error}`, true);
-        return textResult(`Message sent to peer ${to_id}`);
+        const warn = result.warning ? `\n${result.warning}` : "";
+        return textResult(`Message sent to peer ${to_id}${warn}`);
       }
 
       case "broadcast_message": {
@@ -490,6 +651,120 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return textResult(
           `Snippet #${snippet.id}: "${snippet.title}"\nAuthor: ${snippet.author_id}\nLanguage: ${snippet.language}\nCreated: ${snippet.created_at}\n\n\`\`\`${snippet.language}\n${snippet.content}\n\`\`\``
         );
+      }
+
+      // --- New tool handlers ---
+
+      case "set_status": {
+        const { status } = args as { status: string };
+        await brokerFetch("/set-status", { id: myId, status });
+        return textResult(`Status updated to: ${status}`);
+      }
+
+      case "share_file": {
+        const { file_path } = args as { file_path: string };
+        const result = await brokerFetch<{ ok: boolean; file_id?: number; error?: string }>("/share-file", {
+          author_id: myId, file_path,
+        });
+        if (!result.ok) return textResult(`Failed to share file: ${result.error}`, true);
+        return textResult(`File shared as #${result.file_id}: ${file_path}`);
+      }
+
+      case "list_shared_files": {
+        const { limit } = args as { limit?: number };
+        const files = await brokerFetch<Array<{ id: number; author_id: string; filename: string; size_bytes: number; mime_type: string; created_at: string }>>("/list-shared-files", { limit: limit ?? 20 });
+        if (files.length === 0) return textResult("No shared files.");
+        const lines = files.map((f) =>
+          `#${f.id} "${f.filename}" (${f.mime_type}, ${f.size_bytes} bytes) by ${f.author_id} at ${f.created_at}`
+        );
+        return textResult(`Shared files (${files.length}):\n\n${lines.join("\n")}`);
+      }
+
+      case "get_shared_file": {
+        const { id } = args as { id: number };
+        const file = await brokerFetch<SharedFile | null>("/get-shared-file", { id });
+        if (!file) return textResult(`File #${id} not found`, true);
+        return textResult(
+          `File #${file.id}: "${file.filename}"\nAuthor: ${file.author_id}\nSize: ${file.size_bytes} bytes\nType: ${file.mime_type}\nCreated: ${file.created_at}\n\nContent:\n${file.content}`
+        );
+      }
+
+      case "alert_peer": {
+        const { to_id, message, priority } = args as { to_id: string; message: string; priority: string };
+        const result = await brokerFetch<{ ok: boolean; alert_id?: number; error?: string }>("/alert-peer", {
+          from_id: myId, to_id, message, priority,
+        });
+        if (!result.ok) return textResult(`Failed: ${result.error}`, true);
+        return textResult(`Alert #${result.alert_id} sent to ${to_id} [${priority.toUpperCase()}]`);
+      }
+
+      case "alert_all": {
+        const { message, priority } = args as { message: string; priority: string };
+        const result = await brokerFetch<{ ok: boolean; count: number }>("/alert-all", {
+          from_id: myId, message, priority, scope: "machine", cwd: myCwd, git_root: myGitRoot,
+        });
+        return textResult(`Alert broadcast to ${result.count} peer(s) [${priority.toUpperCase()}]`);
+      }
+
+      case "pin_message": {
+        const { content } = args as { content: string };
+        const result = await brokerFetch<{ ok: boolean; pin_id: number }>("/pin-message", {
+          author_id: myId, content,
+        });
+        return textResult(`Message pinned as #${result.pin_id}`);
+      }
+
+      case "list_pins": {
+        const pins = await brokerFetch<Array<{ id: number; author_id: string; content: string; created_at: string }>>("/list-pins", {});
+        if (pins.length === 0) return textResult("No pinned messages.");
+        const lines = pins.map((p) =>
+          `📌 #${p.id} by ${p.author_id} (${p.created_at}):\n  ${p.content}`
+        );
+        return textResult(`Pinned messages (${pins.length}):\n\n${lines.join("\n\n")}`);
+      }
+
+      case "unpin_message": {
+        const { pin_id } = args as { pin_id: number };
+        const result = await brokerFetch<{ ok: boolean; error?: string }>("/unpin-message", {
+          pin_id, peer_id: myId,
+        });
+        if (!result.ok) return textResult(`Failed: ${result.error}`, true);
+        return textResult(`Pin #${pin_id} removed`);
+      }
+
+      case "peer_stats": {
+        const { target_id } = args as { target_id?: string };
+        const stats = await brokerFetch<PeerAnalytics>("/peer-stats", {
+          peer_id: myId, target_id,
+        });
+        const lines = [
+          `Peer: ${stats.peer_id}`,
+          `Messages sent: ${stats.messages_sent}`,
+          `Messages received: ${stats.messages_received}`,
+          `Tasks assigned: ${stats.tasks_assigned}`,
+          `Tasks completed: ${stats.tasks_completed}`,
+          `Snippets shared: ${stats.snippets_shared}`,
+          `Alerts sent: ${stats.alerts_sent}`,
+          `Files shared: ${stats.files_shared}`,
+        ];
+        return textResult(lines.join("\n"));
+      }
+
+      case "request_review": {
+        const { to_id } = args as { to_id: string };
+        const result = await brokerFetch<{ ok: boolean; error?: string }>("/request-review", {
+          from_id: myId, to_id, cwd: myCwd,
+        });
+        if (!result.ok) return textResult(`Failed: ${result.error}`, true);
+        return textResult(`Review request sent to ${to_id}`);
+      }
+
+      case "sync_status": {
+        const { scope } = args as { scope?: string };
+        const result = await brokerFetch<{ ok: boolean; count: number }>("/sync-status", {
+          from_id: myId, cwd: myCwd, scope: scope ?? "machine", git_root: myGitRoot,
+        });
+        return textResult(`Git status broadcast to ${result.count} peer(s)`);
       }
 
       default:
@@ -606,6 +881,68 @@ async function handleWsEvent(event: WsEvent): Promise<void> {
         params: {
           content: `New snippet shared by ${data.author_id}: "${data.title}" (Snippet #${data.id})`,
           meta: { type: "snippet", ...data },
+        },
+      });
+      break;
+    }
+
+    case "alert": {
+      const data = event.data as { id?: number; from_id: string; message: string; priority: string };
+      const priorityIcon = { info: "ℹ️", warning: "⚠️", critical: "🚨" }[data.priority] ?? "ℹ️";
+      await mcp.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: `${priorityIcon} ALERT [${data.priority.toUpperCase()}] from ${data.from_id}: ${data.message}`,
+          meta: { type: "alert", ...data },
+        },
+      });
+      log(`Pushed alert from ${data.from_id}: ${data.message.slice(0, 80)}`);
+      break;
+    }
+
+    case "pin": {
+      const data = event.data as { id: number; author_id: string; content: string };
+      await mcp.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: `📌 New pin by ${data.author_id}: ${data.content}`,
+          meta: { type: "pin", ...data },
+        },
+      });
+      break;
+    }
+
+    case "file_shared": {
+      const data = event.data as { id: number; author_id: string; filename: string; size_bytes: number };
+      await mcp.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: `📎 File shared by ${data.author_id}: "${data.filename}" (${data.size_bytes} bytes) - File #${data.id}`,
+          meta: { type: "file_shared", ...data },
+        },
+      });
+      break;
+    }
+
+    case "review_request": {
+      const data = event.data as { from_id: string; branch: string; diff_stat: string };
+      await mcp.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: `🔍 Review requested by ${data.from_id} on branch "${data.branch}":\n${data.diff_stat}`,
+          meta: { type: "review_request", ...data },
+        },
+      });
+      break;
+    }
+
+    case "sync_status": {
+      const data = event.data as { from_id: string; branch: string; last_commit: string; uncommitted_changes: number };
+      await mcp.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: `📊 Git sync from ${data.from_id}: branch=${data.branch}, last commit="${data.last_commit}", ${data.uncommitted_changes} uncommitted change(s)`,
+          meta: { type: "sync_status", ...data },
         },
       });
       break;

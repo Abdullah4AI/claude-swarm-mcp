@@ -40,10 +40,26 @@ import type {
   ShareSnippetRequest,
   ListSnippetsRequest,
   GetSnippetRequest,
+  SetStatusRequest,
+  ShareFileRequest,
+  ListSharedFilesRequest,
+  GetSharedFileRequest,
+  AlertPeerRequest,
+  AlertAllRequest,
+  PinMessageRequest,
+  UnpinMessageRequest,
+  PeerStatsRequest,
+  RequestReviewRequest,
+  SyncStatusRequest,
   Peer,
   Message,
   Task,
   Snippet,
+  SharedFile,
+  Alert,
+  Pin,
+  PeerAnalytics,
+  PeerStatus,
   WsEvent,
   RateLimitEntry,
 } from "./shared/types.ts";
@@ -106,6 +122,46 @@ db.run(`
     title TEXT NOT NULL,
     content TEXT NOT NULL,
     language TEXT NOT NULL DEFAULT 'text',
+    created_at TEXT NOT NULL
+  )
+`);
+
+// Add status column to peers if missing
+try {
+  db.run("ALTER TABLE peers ADD COLUMN status TEXT NOT NULL DEFAULT 'active'");
+} catch {
+  // column already exists
+}
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS shared_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    author_id TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    content TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    mime_type TEXT NOT NULL DEFAULT 'text/plain',
+    created_at TEXT NOT NULL
+  )
+`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_id TEXT NOT NULL,
+    to_id TEXT NOT NULL,
+    message TEXT NOT NULL,
+    priority TEXT NOT NULL DEFAULT 'info',
+    created_at TEXT NOT NULL,
+    acknowledged INTEGER NOT NULL DEFAULT 0
+  )
+`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS pins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    author_id TEXT NOT NULL,
+    content TEXT NOT NULL,
     created_at TEXT NOT NULL
   )
 `);
@@ -255,6 +311,28 @@ const insertSnippet = db.prepare(`
 const selectSnippets = db.prepare("SELECT * FROM snippets ORDER BY created_at DESC LIMIT ?");
 const selectSnippetById = db.prepare("SELECT * FROM snippets WHERE id = ?");
 
+// --- New prepared statements ---
+
+const updateStatus = db.prepare("UPDATE peers SET status = ? WHERE id = ?");
+
+const insertSharedFile = db.prepare(`
+  INSERT INTO shared_files (author_id, filename, content, size_bytes, mime_type, created_at) VALUES (?, ?, ?, ?, ?, ?)
+`);
+const selectSharedFiles = db.prepare("SELECT id, author_id, filename, size_bytes, mime_type, created_at FROM shared_files ORDER BY created_at DESC LIMIT ?");
+const selectSharedFileById = db.prepare("SELECT * FROM shared_files WHERE id = ?");
+
+const insertAlert = db.prepare(`
+  INSERT INTO alerts (from_id, to_id, message, priority, created_at) VALUES (?, ?, ?, ?, ?)
+`);
+const selectAlertsForPeer = db.prepare("SELECT * FROM alerts WHERE to_id = ? ORDER BY created_at DESC LIMIT ?");
+
+const insertPin = db.prepare(`
+  INSERT INTO pins (author_id, content, created_at) VALUES (?, ?, ?)
+`);
+const selectPins = db.prepare("SELECT * FROM pins ORDER BY created_at DESC LIMIT ?");
+const deletePin = db.prepare("DELETE FROM pins WHERE id = ?");
+const selectPinById = db.prepare("SELECT * FROM pins WHERE id = ?");
+
 // --- Generate peer ID ---
 
 function generateId(): string {
@@ -355,14 +433,14 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   });
 }
 
-function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
+function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string; warning?: string } {
   // Rate limit check
   if (!checkRateLimit(body.from_id)) {
     return { ok: false, error: "Rate limit exceeded (max 60 messages/minute)" };
   }
 
   // Verify target exists
-  const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
+  const target = db.query("SELECT id, status FROM peers WHERE id = ?").get(body.to_id) as { id: string; status?: string } | null;
   if (!target) {
     return { ok: false, error: `Peer ${body.to_id} not found` };
   }
@@ -377,7 +455,8 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
     timestamp: now,
   });
 
-  return { ok: true };
+  const warning = target.status === "dnd" ? `Warning: Peer ${body.to_id} is in Do Not Disturb mode` : undefined;
+  return { ok: true, warning };
 }
 
 function handleBroadcastMessage(body: BroadcastMessageRequest): { ok: boolean; count: number } {
@@ -519,6 +598,245 @@ function handleGetSnippet(body: GetSnippetRequest): Snippet | null {
   return (selectSnippetById.get(body.id) as Snippet) ?? null;
 }
 
+// --- New feature handlers ---
+
+function handleSetStatus(body: SetStatusRequest): void {
+  updateStatus.run(body.status, body.id);
+}
+
+function handleShareFile(body: ShareFileRequest): { ok: boolean; file_id?: number; error?: string } {
+  const MAX_SIZE = 1024 * 1024; // 1MB
+  try {
+    const file = Bun.file(body.file_path);
+    const size = file.size;
+    if (size > MAX_SIZE) {
+      return { ok: false, error: `File too large: ${size} bytes (max ${MAX_SIZE})` };
+    }
+    const content = new TextDecoder().decode(Bun.spawnSync(["cat", body.file_path]).stdout);
+    const filename = body.file_path.split("/").pop() ?? "unknown";
+    const mime = file.type || "text/plain";
+    const now = new Date().toISOString();
+    const result = insertSharedFile.run(body.author_id, filename, content, size, mime, now);
+    const fileId = Number(result.lastInsertRowid);
+
+    broadcastToAll({
+      type: "file_shared",
+      data: { id: fileId, author_id: body.author_id, filename, size_bytes: size },
+      timestamp: now,
+    });
+
+    return { ok: true, file_id: fileId };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+function handleListSharedFiles(body: ListSharedFilesRequest): Omit<SharedFile, "content">[] {
+  return selectSharedFiles.all(body.limit ?? 20) as Omit<SharedFile, "content">[];
+}
+
+function handleGetSharedFile(body: GetSharedFileRequest): SharedFile | null {
+  return (selectSharedFileById.get(body.id) as SharedFile) ?? null;
+}
+
+function handleAlertPeer(body: AlertPeerRequest): { ok: boolean; alert_id?: number; error?: string } {
+  const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
+  if (!target) {
+    return { ok: false, error: `Peer ${body.to_id} not found` };
+  }
+  const now = new Date().toISOString();
+  const result = insertAlert.run(body.from_id, body.to_id, body.message, body.priority, now);
+  const alertId = Number(result.lastInsertRowid);
+
+  notifyPeer(body.to_id, {
+    type: "alert",
+    data: { id: alertId, from_id: body.from_id, message: body.message, priority: body.priority },
+    timestamp: now,
+  });
+
+  return { ok: true, alert_id: alertId };
+}
+
+function handleAlertAll(body: AlertAllRequest): { ok: boolean; count: number } {
+  const listReq: ListPeersRequest = {
+    scope: body.scope ?? "machine",
+    cwd: body.cwd ?? "/",
+    git_root: body.git_root ?? null,
+    exclude_id: body.from_id,
+  };
+  const peers = handleListPeers(listReq);
+  const now = new Date().toISOString();
+
+  for (const peer of peers) {
+    insertAlert.run(body.from_id, peer.id, body.message, body.priority, now);
+    notifyPeer(peer.id, {
+      type: "alert",
+      data: { from_id: body.from_id, message: body.message, priority: body.priority },
+      timestamp: now,
+    });
+  }
+
+  return { ok: true, count: peers.length };
+}
+
+function handlePinMessage(body: PinMessageRequest): { ok: boolean; pin_id: number } {
+  const now = new Date().toISOString();
+  const result = insertPin.run(body.author_id, body.content, now);
+  const pinId = Number(result.lastInsertRowid);
+
+  broadcastToAll({
+    type: "pin",
+    data: { id: pinId, author_id: body.author_id, content: body.content },
+    timestamp: now,
+  });
+
+  return { ok: true, pin_id: pinId };
+}
+
+function handleListPins(): Pin[] {
+  return selectPins.all(100) as Pin[];
+}
+
+function handleUnpinMessage(body: UnpinMessageRequest): { ok: boolean; error?: string } {
+  const pin = selectPinById.get(body.pin_id) as Pin | null;
+  if (!pin) return { ok: false, error: `Pin #${body.pin_id} not found` };
+  deletePin.run(body.pin_id);
+  return { ok: true };
+}
+
+function handlePeerStats(body: PeerStatsRequest): PeerAnalytics {
+  const targetId = body.target_id ?? body.peer_id;
+  const sent = (db.query("SELECT COUNT(*) as c FROM messages WHERE from_id = ?").get(targetId) as { c: number }).c;
+  const received = (db.query("SELECT COUNT(*) as c FROM messages WHERE to_id = ?").get(targetId) as { c: number }).c;
+  const tasksAssigned = (db.query("SELECT COUNT(*) as c FROM tasks WHERE from_id = ?").get(targetId) as { c: number }).c;
+  const tasksCompleted = (db.query("SELECT COUNT(*) as c FROM tasks WHERE to_id = ? AND state = 'completed'").get(targetId) as { c: number }).c;
+  const snippetsShared = (db.query("SELECT COUNT(*) as c FROM snippets WHERE author_id = ?").get(targetId) as { c: number }).c;
+  const alertsSent = (db.query("SELECT COUNT(*) as c FROM alerts WHERE from_id = ?").get(targetId) as { c: number }).c;
+  const filesShared = (db.query("SELECT COUNT(*) as c FROM shared_files WHERE author_id = ?").get(targetId) as { c: number }).c;
+
+  return {
+    peer_id: targetId,
+    messages_sent: sent,
+    messages_received: received,
+    tasks_assigned: tasksAssigned,
+    tasks_completed: tasksCompleted,
+    snippets_shared: snippetsShared,
+    alerts_sent: alertsSent,
+    files_shared: filesShared,
+  };
+}
+
+function handleAnalytics(): object {
+  const peers = selectAllPeers.all() as Peer[];
+  const alivePeers = peers.filter((p) => {
+    try { process.kill(p.pid, 0); return true; } catch { return false; }
+  });
+
+  const peerStats = alivePeers.map((p) => ({
+    id: p.id,
+    summary: p.summary,
+    ...handlePeerStats({ peer_id: p.id }),
+  }));
+
+  // Most active peers (by total messages sent)
+  const mostActive = [...peerStats].sort((a, b) => (b.messages_sent + b.messages_received) - (a.messages_sent + a.messages_received));
+
+  // Peak activity hours
+  const hourCounts = db.query(`
+    SELECT CAST(strftime('%H', sent_at) AS INTEGER) as hour, COUNT(*) as count 
+    FROM messages GROUP BY hour ORDER BY count DESC
+  `).all() as Array<{ hour: number; count: number }>;
+
+  // Task completion rate
+  const totalTasks = (db.query("SELECT COUNT(*) as c FROM tasks").get() as { c: number }).c;
+  const completedTasks = (db.query("SELECT COUNT(*) as c FROM tasks WHERE state = 'completed'").get() as { c: number }).c;
+  const completionRate = totalTasks > 0 ? (completedTasks / totalTasks * 100).toFixed(1) : "0.0";
+
+  return {
+    total_peers: alivePeers.length,
+    peer_stats: mostActive,
+    peak_hours: hourCounts.slice(0, 5),
+    task_completion_rate: `${completionRate}%`,
+    total_tasks: totalTasks,
+    completed_tasks: completedTasks,
+  };
+}
+
+async function handleRequestReview(body: RequestReviewRequest): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const proc = Bun.spawn(["git", "diff", "--stat", "HEAD~1"], {
+      cwd: body.cwd, stdout: "pipe", stderr: "ignore",
+    });
+    const diffStat = await new Response(proc.stdout).text();
+    const branchProc = Bun.spawn(["git", "rev-parse", "--abbrev-ref", "HEAD"], {
+      cwd: body.cwd, stdout: "pipe", stderr: "ignore",
+    });
+    const branch = (await new Response(branchProc.stdout).text()).trim();
+
+    const reviewMsg = `🔍 Review Request from ${body.from_id}\nBranch: ${branch}\nChanges:\n${diffStat.trim()}`;
+
+    const sendResult = handleSendMessage({
+      from_id: body.from_id,
+      to_id: body.to_id,
+      text: reviewMsg,
+    });
+
+    notifyPeer(body.to_id, {
+      type: "review_request",
+      data: { from_id: body.from_id, branch, diff_stat: diffStat.trim() },
+      timestamp: new Date().toISOString(),
+    });
+
+    return { ok: sendResult.ok, error: sendResult.error };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+async function handleSyncStatus(body: SyncStatusRequest): Promise<{ ok: boolean; count: number }> {
+  try {
+    const branchProc = Bun.spawn(["git", "rev-parse", "--abbrev-ref", "HEAD"], {
+      cwd: body.cwd, stdout: "pipe", stderr: "ignore",
+    });
+    const branch = (await new Response(branchProc.stdout).text()).trim();
+
+    const statusProc = Bun.spawn(["git", "status", "--short"], {
+      cwd: body.cwd, stdout: "pipe", stderr: "ignore",
+    });
+    const status = (await new Response(statusProc.stdout).text()).trim();
+
+    const logProc = Bun.spawn(["git", "log", "--oneline", "-1"], {
+      cwd: body.cwd, stdout: "pipe", stderr: "ignore",
+    });
+    const lastCommit = (await new Response(logProc.stdout).text()).trim();
+
+    const uncommitted = status ? status.split("\n").length : 0;
+    const syncMsg = `📊 Git Status from ${body.from_id}\nBranch: ${branch}\nLast commit: ${lastCommit}\nUncommitted changes: ${uncommitted}${status ? `\n${status}` : ""}`;
+
+    const listReq: ListPeersRequest = {
+      scope: body.scope ?? "machine",
+      cwd: body.cwd,
+      git_root: body.git_root ?? null,
+      exclude_id: body.from_id,
+    };
+    const peers = handleListPeers(listReq);
+    const now = new Date().toISOString();
+
+    for (const peer of peers) {
+      insertMessage.run(body.from_id, peer.id, syncMsg, now);
+      notifyPeer(peer.id, {
+        type: "sync_status",
+        data: { from_id: body.from_id, branch, last_commit: lastCommit, uncommitted_changes: uncommitted },
+        timestamp: now,
+      });
+    }
+
+    return { ok: true, count: peers.length };
+  } catch (e) {
+    return { ok: true, count: 0 };
+  }
+}
+
 function handleUnregister(body: { id: string }): void {
   const now = new Date().toISOString();
   deletePeer.run(body.id);
@@ -546,19 +864,75 @@ function generateDashboard(): string {
   const totalMessages = (db.query("SELECT COUNT(*) as c FROM messages").get() as { c: number }).c;
   const pendingTasks = (db.query("SELECT COUNT(*) as c FROM tasks WHERE state = 'pending'").get() as { c: number }).c;
   const totalSnippets = (db.query("SELECT COUNT(*) as c FROM snippets").get() as { c: number }).c;
+  const totalAlerts = (db.query("SELECT COUNT(*) as c FROM alerts WHERE acknowledged = 0").get() as { c: number }).c;
+  const totalPins = (db.query("SELECT COUNT(*) as c FROM pins").get() as { c: number }).c;
+  const totalFiles = (db.query("SELECT COUNT(*) as c FROM shared_files").get() as { c: number }).c;
+
+  const statusColors: Record<string, string> = {
+    active: "#3fb950",
+    busy: "#d29922",
+    away: "#8b949e",
+    dnd: "#f85149",
+  };
 
   const peerRows = alivePeers.map((p) => {
     const tags = (() => { try { return JSON.parse(p.tags) as string[]; } catch { return []; } })();
     const tagBadges = tags.map((t: string) => `<span class="tag">${escapeHtml(t)}</span>`).join(" ");
+    const status = (p as Peer & { status?: string }).status ?? "active";
+    const dotColor = statusColors[status] ?? statusColors.active;
     return `
       <tr>
-        <td><code>${escapeHtml(p.id)}</code></td>
+        <td><span class="status-dot" style="background:${dotColor}" title="${status}"></span> <code>${escapeHtml(p.id)}</code></td>
         <td>${p.pid}</td>
+        <td>${escapeHtml(status)}</td>
         <td title="${escapeHtml(p.cwd)}">${escapeHtml(truncatePath(p.cwd))}</td>
         <td>${escapeHtml(p.summary || "(none)")}</td>
         <td>${tagBadges || "(none)"}</td>
         <td>${timeAgo(p.last_seen)}</td>
       </tr>`;
+  }).join("");
+
+  // Recent messages for activity
+  const recentMsgs = db.query("SELECT from_id, text, sent_at FROM messages ORDER BY sent_at DESC LIMIT 5").all() as Array<{ from_id: string; text: string; sent_at: string }>;
+  const activityRows = recentMsgs.map((m) =>
+    `<tr><td><code>${escapeHtml(m.from_id)}</code></td><td>${escapeHtml(m.text.slice(0, 80))}${m.text.length > 80 ? "..." : ""}</td><td>${timeAgo(m.sent_at)}</td></tr>`
+  ).join("");
+
+  // Active tasks
+  const activeTasks = db.query("SELECT id, from_id, to_id, description, state FROM tasks WHERE state IN ('pending','in_progress') ORDER BY updated_at DESC LIMIT 5").all() as Array<{ id: number; from_id: string; to_id: string; description: string; state: string }>;
+  const taskRows = activeTasks.map((t) => {
+    const stateColor = t.state === "pending" ? "#d29922" : "#58a6ff";
+    return `<tr><td>#${t.id}</td><td><span style="color:${stateColor}">${t.state.toUpperCase()}</span></td><td>${escapeHtml(t.from_id)} → ${escapeHtml(t.to_id)}</td><td>${escapeHtml(t.description.slice(0, 60))}</td></tr>`;
+  }).join("");
+
+  // Recent snippets
+  const recentSnippets = db.query("SELECT id, author_id, title, language FROM snippets ORDER BY created_at DESC LIMIT 5").all() as Array<{ id: number; author_id: string; title: string; language: string }>;
+  const snippetRows = recentSnippets.map((s) =>
+    `<tr><td>#${s.id}</td><td>${escapeHtml(s.title)}</td><td>${escapeHtml(s.language)}</td><td><code>${escapeHtml(s.author_id)}</code></td></tr>`
+  ).join("");
+
+  // Pinned messages
+  const pins = (selectPins.all(5) as Pin[]);
+  const pinRows = pins.map((p) =>
+    `<tr><td>#${p.id}</td><td>${escapeHtml(p.content.slice(0, 80))}</td><td><code>${escapeHtml(p.author_id)}</code></td><td>${timeAgo(p.created_at)}</td></tr>`
+  ).join("");
+
+  // Message activity graph (last 12 hours)
+  const hourBuckets: number[] = new Array(12).fill(0);
+  const hourLabels: string[] = [];
+  const now = Date.now();
+  for (let i = 11; i >= 0; i--) {
+    const hourStart = new Date(now - i * 3600_000);
+    const hourEnd = new Date(now - (i - 1) * 3600_000);
+    hourLabels.push(hourStart.getHours().toString().padStart(2, "0"));
+    const count = (db.query("SELECT COUNT(*) as c FROM messages WHERE sent_at >= ? AND sent_at < ?").get(hourStart.toISOString(), hourEnd.toISOString()) as { c: number }).c;
+    hourBuckets[11 - i] = count;
+  }
+  const maxCount = Math.max(...hourBuckets, 1);
+  const barHeight = 60;
+  const graphBars = hourBuckets.map((count, i) => {
+    const h = Math.round((count / maxCount) * barHeight);
+    return `<div class="graph-bar-wrap"><div class="graph-bar" style="height:${h}px" title="${count} msgs"></div><div class="graph-label">${hourLabels[i]}</div></div>`;
   }).join("");
 
   return `<!DOCTYPE html>
@@ -571,38 +945,78 @@ function generateDashboard(): string {
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0d1117; color: #c9d1d9; padding: 2rem; }
     h1 { color: #58a6ff; margin-bottom: 0.5rem; font-size: 1.8rem; }
+    h2 { color: #c9d1d9; margin: 1.5rem 0 0.75rem; font-size: 1.2rem; }
     .subtitle { color: #8b949e; margin-bottom: 2rem; }
-    .stats { display: flex; gap: 1.5rem; margin-bottom: 2rem; flex-wrap: wrap; }
-    .stat { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem 1.5rem; min-width: 140px; }
-    .stat-value { font-size: 2rem; font-weight: 700; color: #58a6ff; }
-    .stat-label { color: #8b949e; font-size: 0.85rem; }
-    table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; border: 1px solid #30363d; }
-    th { background: #21262d; color: #8b949e; text-align: left; padding: 0.75rem 1rem; font-weight: 600; font-size: 0.85rem; text-transform: uppercase; }
-    td { padding: 0.75rem 1rem; border-top: 1px solid #21262d; }
+    .stats { display: flex; gap: 1rem; margin-bottom: 2rem; flex-wrap: wrap; }
+    .stat { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 0.75rem 1.25rem; min-width: 120px; flex: 1; }
+    .stat-value { font-size: 1.8rem; font-weight: 700; color: #58a6ff; }
+    .stat-label { color: #8b949e; font-size: 0.8rem; }
+    table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; border: 1px solid #30363d; margin-bottom: 1rem; }
+    th { background: #21262d; color: #8b949e; text-align: left; padding: 0.6rem 0.8rem; font-weight: 600; font-size: 0.8rem; text-transform: uppercase; }
+    td { padding: 0.6rem 0.8rem; border-top: 1px solid #21262d; font-size: 0.9rem; }
     tr:hover td { background: #1c2128; }
-    code { background: #21262d; padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.9rem; color: #f0883e; }
-    .tag { display: inline-block; background: #1f6feb33; color: #58a6ff; padding: 0.1rem 0.5rem; border-radius: 10px; font-size: 0.8rem; margin: 0.1rem; }
-    .empty { text-align: center; padding: 2rem; color: #8b949e; }
-    .refresh { margin-top: 1rem; color: #8b949e; font-size: 0.85rem; }
+    code { background: #21262d; padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.85rem; color: #f0883e; }
+    .tag { display: inline-block; background: #1f6feb33; color: #58a6ff; padding: 0.1rem 0.5rem; border-radius: 10px; font-size: 0.75rem; margin: 0.1rem; }
+    .empty { text-align: center; padding: 1.5rem; color: #8b949e; background: #161b22; border: 1px solid #30363d; border-radius: 8px; }
+    .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+    .graph-container { display: flex; align-items: flex-end; gap: 4px; height: 80px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px 10px 0; margin-bottom: 1rem; }
+    .graph-bar-wrap { display: flex; flex-direction: column; align-items: center; flex: 1; }
+    .graph-bar { background: #58a6ff; border-radius: 2px 2px 0 0; width: 100%; min-width: 12px; transition: height 0.3s; }
+    .graph-label { font-size: 0.65rem; color: #8b949e; margin-top: 2px; padding-bottom: 4px; }
+    .section-icon { margin-right: 0.4rem; }
+    .refresh-bar { margin-top: 1.5rem; padding: 0.5rem; text-align: center; color: #8b949e; font-size: 0.8rem; border-top: 1px solid #21262d; }
   </style>
 </head>
 <body>
   <h1>🐝 Claude Swarm Dashboard</h1>
-  <p class="subtitle">Your Claude Code instances, working as a swarm</p>
+  <p class="subtitle">Real-time swarm coordination overview</p>
+
   <div class="stats">
     <div class="stat"><div class="stat-value">${alivePeers.length}</div><div class="stat-label">Active Peers</div></div>
-    <div class="stat"><div class="stat-value">${totalMessages}</div><div class="stat-label">Total Messages</div></div>
+    <div class="stat"><div class="stat-value">${totalMessages}</div><div class="stat-label">Messages</div></div>
     <div class="stat"><div class="stat-value">${pendingTasks}</div><div class="stat-label">Pending Tasks</div></div>
-    <div class="stat"><div class="stat-value">${totalSnippets}</div><div class="stat-label">Shared Snippets</div></div>
+    <div class="stat"><div class="stat-value">${totalSnippets}</div><div class="stat-label">Snippets</div></div>
+    <div class="stat"><div class="stat-value">${totalAlerts}</div><div class="stat-label">Alerts</div></div>
+    <div class="stat"><div class="stat-value">${totalPins}</div><div class="stat-label">Pins</div></div>
+    <div class="stat"><div class="stat-value">${totalFiles}</div><div class="stat-label">Files</div></div>
   </div>
-  <h2 style="color: #c9d1d9; margin-bottom: 1rem;">Active Peers</h2>
+
+  <h2><span class="section-icon">📊</span>Message Activity (Last 12h)</h2>
+  <div class="graph-container">${graphBars}</div>
+
+  <h2><span class="section-icon">👥</span>Peers</h2>
   ${alivePeers.length > 0 ? `
   <table>
-    <thead><tr><th>ID</th><th>PID</th><th>Directory</th><th>Summary</th><th>Tags</th><th>Last Seen</th></tr></thead>
+    <thead><tr><th>ID</th><th>PID</th><th>Status</th><th>Directory</th><th>Summary</th><th>Tags</th><th>Last Seen</th></tr></thead>
     <tbody>${peerRows}</tbody>
   </table>` : '<div class="empty">No active peers. Start a Claude Code instance with claude-swarm-mcp configured.</div>'}
-  <p class="refresh">Auto-refreshes every 10s</p>
-  <script>setTimeout(() => location.reload(), 10000);</script>
+
+  <div class="grid">
+    <div>
+      <h2><span class="section-icon">📌</span>Pinned Messages</h2>
+      ${pins.length > 0 ? `<table><thead><tr><th>#</th><th>Content</th><th>By</th><th>When</th></tr></thead><tbody>${pinRows}</tbody></table>` : '<div class="empty">No pinned messages</div>'}
+    </div>
+    <div>
+      <h2><span class="section-icon">📋</span>Active Tasks</h2>
+      ${activeTasks.length > 0 ? `<table><thead><tr><th>#</th><th>State</th><th>Flow</th><th>Description</th></tr></thead><tbody>${taskRows}</tbody></table>` : '<div class="empty">No active tasks</div>'}
+    </div>
+  </div>
+
+  <div class="grid">
+    <div>
+      <h2><span class="section-icon">💬</span>Recent Messages</h2>
+      ${recentMsgs.length > 0 ? `<table><thead><tr><th>From</th><th>Message</th><th>When</th></tr></thead><tbody>${activityRows}</tbody></table>` : '<div class="empty">No messages yet</div>'}
+    </div>
+    <div>
+      <h2><span class="section-icon">📝</span>Recent Snippets</h2>
+      ${recentSnippets.length > 0 ? `<table><thead><tr><th>#</th><th>Title</th><th>Lang</th><th>Author</th></tr></thead><tbody>${snippetRows}</tbody></table>` : '<div class="empty">No snippets yet</div>'}
+    </div>
+  </div>
+
+  <div class="refresh-bar">Auto-refreshes every 5 seconds</div>
+  <script>setTimeout(() => location.reload(), 5000);</script>
 </body>
 </html>`;
 }
@@ -651,6 +1065,11 @@ Bun.serve<{ peerId: string }>({
       return new Response(generateDashboard(), {
         headers: { "Content-Type": "text/html; charset=utf-8" },
       });
+    }
+
+    // Analytics endpoint (GET)
+    if (path === "/analytics") {
+      return Response.json(handleAnalytics());
     }
 
     // Health check (GET)
@@ -705,6 +1124,31 @@ Bun.serve<{ peerId: string }>({
             return Response.json(handleListSnippets(body as ListSnippetsRequest));
           case "/get-snippet":
             return Response.json(handleGetSnippet(body as GetSnippetRequest));
+          case "/set-status":
+            handleSetStatus(body as SetStatusRequest);
+            return Response.json({ ok: true });
+          case "/share-file":
+            return Response.json(handleShareFile(body as ShareFileRequest));
+          case "/list-shared-files":
+            return Response.json(handleListSharedFiles(body as ListSharedFilesRequest));
+          case "/get-shared-file":
+            return Response.json(handleGetSharedFile(body as GetSharedFileRequest));
+          case "/alert-peer":
+            return Response.json(handleAlertPeer(body as AlertPeerRequest));
+          case "/alert-all":
+            return Response.json(handleAlertAll(body as AlertAllRequest));
+          case "/pin-message":
+            return Response.json(handlePinMessage(body as PinMessageRequest));
+          case "/list-pins":
+            return Response.json(handleListPins());
+          case "/unpin-message":
+            return Response.json(handleUnpinMessage(body as UnpinMessageRequest));
+          case "/peer-stats":
+            return Response.json(handlePeerStats(body as PeerStatsRequest));
+          case "/request-review":
+            return Response.json(await handleRequestReview(body as RequestReviewRequest));
+          case "/sync-status":
+            return Response.json(await handleSyncStatus(body as SyncStatusRequest));
           case "/unregister":
             handleUnregister(body as { id: string });
             return Response.json({ ok: true });

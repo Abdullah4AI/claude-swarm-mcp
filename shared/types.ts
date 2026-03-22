@@ -17,6 +17,7 @@ export interface Peer {
   tty: string | null;
   summary: string;
   tags: string; // JSON array string, e.g. '["frontend","backend"]'
+  status: PeerStatus;
   registered_at: string;
   last_seen: string;
 }
@@ -157,9 +158,125 @@ export interface GetSnippetRequest {
   id: number;
 }
 
+// --- Peer Status ---
+
+export type PeerStatus = "active" | "busy" | "away" | "dnd";
+
+export interface SetStatusRequest {
+  id: PeerId;
+  status: PeerStatus;
+}
+
+// --- File Sharing ---
+
+export interface SharedFile {
+  id: number;
+  author_id: PeerId;
+  filename: string;
+  content: string;
+  size_bytes: number;
+  mime_type: string;
+  created_at: string;
+}
+
+export interface ShareFileRequest {
+  author_id: PeerId;
+  file_path: string;
+}
+
+export interface ListSharedFilesRequest {
+  limit?: number;
+}
+
+export interface GetSharedFileRequest {
+  id: number;
+}
+
+// --- Alerts ---
+
+export type AlertPriority = "info" | "warning" | "critical";
+
+export interface Alert {
+  id: number;
+  from_id: PeerId;
+  to_id: PeerId;
+  message: string;
+  priority: AlertPriority;
+  created_at: string;
+  acknowledged: number;
+}
+
+export interface AlertPeerRequest {
+  from_id: PeerId;
+  to_id: PeerId;
+  message: string;
+  priority: AlertPriority;
+}
+
+export interface AlertAllRequest {
+  from_id: PeerId;
+  message: string;
+  priority: AlertPriority;
+  scope?: "machine" | "directory" | "repo";
+  cwd?: string;
+  git_root?: string | null;
+}
+
+// --- Pinned Messages ---
+
+export interface Pin {
+  id: number;
+  author_id: PeerId;
+  content: string;
+  created_at: string;
+}
+
+export interface PinMessageRequest {
+  author_id: PeerId;
+  content: string;
+}
+
+export interface UnpinMessageRequest {
+  pin_id: number;
+  peer_id: PeerId;
+}
+
+// --- Analytics ---
+
+export interface PeerAnalytics {
+  peer_id: PeerId;
+  messages_sent: number;
+  messages_received: number;
+  tasks_assigned: number;
+  tasks_completed: number;
+  snippets_shared: number;
+  alerts_sent: number;
+  files_shared: number;
+}
+
+export interface PeerStatsRequest {
+  peer_id: PeerId;
+  target_id?: PeerId;
+}
+
+// --- Auto-coordination ---
+
+export interface RequestReviewRequest {
+  from_id: PeerId;
+  to_id: PeerId;
+  cwd: string;
+}
+
+export interface SyncStatusRequest {
+  from_id: PeerId;
+  cwd: string;
+  scope?: "machine" | "directory" | "repo";
+  git_root?: string | null;
+}
+
 // --- WebSocket event types ---
 
-export type WsEventType = "message" | "broadcast" | "task" | "snippet" | "peer_joined" | "peer_left";
+export type WsEventType = "message" | "broadcast" | "task" | "snippet" | "peer_joined" | "peer_left" | "alert" | "pin" | "file_shared" | "review_request" | "sync_status";
 
 export interface WsEvent {
   type: WsEventType;

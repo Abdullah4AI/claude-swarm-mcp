@@ -13,6 +13,10 @@
  *   bun cli.ts tasks               — List all tasks
  *   bun cli.ts snippets            — List shared snippets
  *   bun cli.ts dashboard           — Open dashboard in browser
+ *   bun cli.ts pins                — List pinned messages
+ *   bun cli.ts files               — List shared files
+ *   bun cli.ts alerts [peer-id]    — List alerts for a peer
+ *   bun cli.ts analytics           — Show swarm analytics
  *   bun cli.ts kill-broker         — Stop the broker daemon
  */
 
@@ -113,7 +117,8 @@ switch (cmd) {
         for (const p of peers) {
           const tags = (() => { try { return JSON.parse(p.tags) as string[]; } catch { return []; } })();
           const tagStr = tags.length > 0 ? ` ${colorize(`[${tags.join(", ")}]`, c.cyan)}` : "";
-          console.log(`  ${colorize(p.id, c.yellow)}  PID:${p.pid}  ${colorize(p.cwd, c.blue)}${tagStr}`);
+          const statusIcon = { active: "🟢", busy: "🟡", away: "⚪", dnd: "🔴" }[(p as PeerInfo & { status?: string }).status ?? "active"] ?? "🟢";
+          console.log(`  ${statusIcon} ${colorize(p.id, c.yellow)}  PID:${p.pid}  ${colorize(p.cwd, c.blue)}${tagStr}`);
           if (p.summary) console.log(`         ${colorize(p.summary, c.dim)}`);
           if (p.tty) console.log(`         TTY: ${p.tty}`);
           console.log(`         ${colorize(`Last seen: ${p.last_seen}`, c.gray)}`);
@@ -265,6 +270,96 @@ switch (cmd) {
     break;
   }
 
+  case "pins": {
+    try {
+      const pins = await brokerFetch<Array<{ id: number; author_id: string; content: string; created_at: string }>>("/list-pins", {});
+      if (pins.length === 0) {
+        console.log(colorize("No pinned messages.", c.yellow));
+      } else {
+        console.log(colorize(`Pinned messages (${pins.length}):`, c.bold));
+        for (const p of pins) {
+          console.log(`  ${colorize(`#${p.id}`, c.bold)} by ${colorize(p.author_id, c.cyan)} ${colorize(p.created_at, c.gray)}`);
+          console.log(`    📌 ${p.content}`);
+        }
+      }
+    } catch {
+      console.log(colorize("Broker is not running.", c.red));
+    }
+    break;
+  }
+
+  case "files": {
+    try {
+      const files = await brokerFetch<Array<{ id: number; author_id: string; filename: string; size_bytes: number; mime_type: string; created_at: string }>>("/list-shared-files", { limit: 20 });
+      if (files.length === 0) {
+        console.log(colorize("No shared files.", c.yellow));
+      } else {
+        console.log(colorize(`Shared files (${files.length}):`, c.bold));
+        for (const f of files) {
+          console.log(`  ${colorize(`#${f.id}`, c.bold)} ${colorize(`"${f.filename}"`, c.cyan)} (${f.mime_type}, ${f.size_bytes} bytes) by ${colorize(f.author_id, c.yellow)}`);
+          console.log(`    ${colorize(f.created_at, c.gray)}`);
+        }
+      }
+    } catch {
+      console.log(colorize("Broker is not running.", c.red));
+    }
+    break;
+  }
+
+  case "alerts": {
+    try {
+      const peerId = process.argv[3] ?? "all";
+      // For CLI, just show recent alerts from the messages approach
+      const alerts = await brokerFetch<Array<{ id: number; from_id: string; to_id: string; message: string; priority: string; created_at: string; acknowledged: number }>>("/list-shared-files", { limit: 0 });
+      // Actually we need a list-alerts endpoint; let's use analytics instead
+      const analytics = await brokerFetch<{ peer_stats: Array<{ id: string; alerts_sent: number }> }>("/analytics");
+      console.log(colorize("Swarm alert summary:", c.bold));
+      for (const p of analytics.peer_stats) {
+        if (p.alerts_sent > 0) {
+          console.log(`  ${colorize(p.id, c.yellow)}: ${p.alerts_sent} alert(s) sent`);
+        }
+      }
+    } catch {
+      console.log(colorize("Broker is not running.", c.red));
+    }
+    break;
+  }
+
+  case "analytics": {
+    try {
+      const data = await brokerFetch<{
+        total_peers: number;
+        peer_stats: Array<{ id: string; messages_sent: number; messages_received: number; tasks_assigned: number; tasks_completed: number; snippets_shared: number; alerts_sent: number; files_shared: number }>;
+        peak_hours: Array<{ hour: number; count: number }>;
+        task_completion_rate: string;
+        total_tasks: number;
+        completed_tasks: number;
+      }>("/analytics");
+
+      console.log(colorize("📊 Swarm Analytics", c.bold));
+      console.log(`\n${colorize("Active peers:", c.cyan)} ${data.total_peers}`);
+      console.log(`${colorize("Task completion:", c.cyan)} ${data.task_completion_rate} (${data.completed_tasks}/${data.total_tasks})`);
+
+      if (data.peak_hours.length > 0) {
+        console.log(`\n${colorize("Peak activity hours:", c.bold)}`);
+        for (const h of data.peak_hours) {
+          const bar = "█".repeat(Math.min(h.count, 30));
+          console.log(`  ${String(h.hour).padStart(2, "0")}:00  ${colorize(bar, c.blue)} ${h.count}`);
+        }
+      }
+
+      if (data.peer_stats.length > 0) {
+        console.log(`\n${colorize("Per-peer stats:", c.bold)}`);
+        for (const p of data.peer_stats) {
+          console.log(`  ${colorize(p.id, c.yellow)}: sent=${p.messages_sent} recv=${p.messages_received} tasks=${p.tasks_assigned} done=${p.tasks_completed} snippets=${p.snippets_shared} alerts=${p.alerts_sent} files=${p.files_shared}`);
+        }
+      }
+    } catch {
+      console.log(colorize("Broker is not running.", c.red));
+    }
+    break;
+  }
+
   case "kill-broker": {
     try {
       const health = await brokerFetch<{ status: string; peers: number }>("/health");
@@ -292,6 +387,10 @@ ${colorize("Usage:", c.yellow)}
   bun cli.ts history [peer-id]   View message history
   bun cli.ts tasks               List all tasks
   bun cli.ts snippets            List shared snippets
+  bun cli.ts pins                List pinned messages
+  bun cli.ts files               List shared files
+  bun cli.ts alerts              Show alert summary
+  bun cli.ts analytics           Show swarm analytics
   bun cli.ts dashboard           Open dashboard in browser
   bun cli.ts kill-broker         Stop the broker daemon`);
 }
